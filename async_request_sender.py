@@ -55,6 +55,9 @@ class Context:
     ttft: Optional[float] = field(default=None)
     tpot: Optional[float] = field(default=None)
     tps: float = field(default=0)
+    ## ramp-up support
+    request_start_time: float = field(default=0)  # absolute time when request was sent
+    ttft_event: Optional[asyncio.Event] = field(default=None, repr=False)  # event signaled when TTFT is received
 
     def clean(self):
         self.error = None
@@ -64,6 +67,8 @@ class Context:
         self.ttft = None
         self.tpot = None
         self.tps = 0
+        self.request_start_time = 0
+        self.ttft_event = None
 
 @dataclass
 class InputParameter:
@@ -135,6 +140,81 @@ class AysncRequestSender:
         await asyncio.gather(*tasks)
         progress_bar.close()
 
+    async def post_batch_requests_with_rampup(self, contexts: List[Context], chat: bool, parallel: int, extra: Dict[str, Any], ramp_up_count: int):
+        """
+        Send requests with gradual ramp-up to avoid head-of-line queuing.
+
+        Ramp-up strategy:
+          1. Fire parallel//2 requests simultaneously (fast half-fill)
+          2. Then send remaining requests one-by-one, each after previous TTFT
+          3. Wait until ALL ramp-up requests have received their first token
+          4. Only then allow measurement requests to proceed
+
+        This ensures the server is at steady-state `parallel` concurrency before
+        any measurement request starts. Tail requests keep the pipeline full so
+        the last measurement request also finishes under full concurrency.
+
+        Args:
+            contexts: All contexts (ramp_up + measurement + tail)
+            chat: Whether to use chat API
+            parallel: Target concurrency level
+            extra: Extra request parameters
+            ramp_up_count: Number of ramp-up requests (typically == parallel)
+        """
+        tasks: List[asyncio.Task] = []
+        num = len(contexts)
+        progress_bar = async_tqdm(total=num, desc="Processing Requests (with ramp-up)", smoothing=0.0)
+        if parallel is None or parallel <= 0:
+            parallel = 1000
+
+        # Setup ttft_event for ramp-up requests
+        for i in range(ramp_up_count):
+            contexts[i].ttft_event = asyncio.Event()
+
+        # Start with semaphore=0, ramp controller will release slots
+        semaphore = asyncio.Semaphore(0)
+
+        # Create all request tasks (they will block on semaphore)
+        for i in range(num):
+            task = asyncio.create_task(self._post_one_request_with_semaphore(semaphore, contexts[i], chat, extra))
+            tasks.append(task)
+            task.add_done_callback(lambda _: progress_bar.update())
+
+        # Ramp-up controller: fast half-fill then one-by-one to full concurrency
+        async def ramp_controller():
+            half = max(1, parallel // 2)
+            logger.info(f"Ramp-up: burst {half} requests, then ramp to {parallel} one-by-one")
+
+            # Phase 1: burst parallel//2 requests at once
+            for _ in range(half):
+                semaphore.release()
+            # Wait for all burst requests to receive TTFT
+            for i in range(half):
+                try:
+                    await asyncio.wait_for(contexts[i].ttft_event.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Ramp-up request [{i}] TTFT timeout (300s), continuing")
+            logger.info(f"Ramp-up phase 1 done: {half} requests all received TTFT")
+
+            # Phase 2: send remaining ramp-up requests one-by-one
+            for i in range(half, ramp_up_count):
+                semaphore.release()
+                try:
+                    await asyncio.wait_for(contexts[i].ttft_event.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Ramp-up request [{i}] TTFT timeout (300s), continuing")
+                if self.verbose:
+                    logger.info(f"Ramp-up [{i+1}/{ramp_up_count}]: TTFT received")
+
+            logger.info(f"Ramp-up complete: all {ramp_up_count} requests received TTFT, concurrency={parallel}. Starting measurement.")
+            # All ramp-up requests are now in-flight (decoding).
+            # As each finishes, it releases its semaphore slot, letting the next
+            # measurement/tail request start — maintaining steady-state concurrency.
+
+        controller_task = asyncio.create_task(ramp_controller())
+        await asyncio.gather(controller_task, *tasks)
+        progress_bar.close()
+
     async def _post_one_request_with_semaphore(self, semaphore: asyncio.Semaphore, ctx: Context, chat: bool, extra: Dict[str, Any]):
         async with semaphore:
             if "models/ensemble" in self.endpoint:
@@ -183,8 +263,7 @@ class AysncRequestSender:
             if self.verbose:
                 logger.info(f"Send request[{ctx.index}], {ctx.prompt_len}, {ctx.max_tokens}")
             request_start_time = time.perf_counter()
-            # print(f"[AKing info] ignore_eos: {payload['ignore_eos']}, nvext: {payload['nvext']}, max_tokens: {payload['max_tokens']}")
-            #print(f"=== begin post: {url}, {payload}")
+            ctx.request_start_time = request_start_time
             async with session.post(url, headers = self.headers, json = payload) as res:
                 if res.status != 200:
                     text = await res.text()
@@ -223,6 +302,8 @@ class AysncRequestSender:
                                         ctx.prompt_tokens = obj["usage"]["prompt_tokens"]
                                 if ctx.ttft is None:
                                     ctx.ttft = time.perf_counter() - request_start_time
+                                    if ctx.ttft_event is not None:
+                                        ctx.ttft_event.set()
                                 if content is not None:
                                     ## print
                                     #print(content, end="", flush=True)
@@ -236,6 +317,9 @@ class AysncRequestSender:
 
             if ctx.e2e_latency < 0.0001:
                 ctx.e2e_latency = time.perf_counter() - request_start_time
+            # Ensure ttft_event is always set (prevent ramp controller deadlock on error)
+            if ctx.ttft_event is not None and not ctx.ttft_event.is_set():
+                ctx.ttft_event.set()
             if self.verbose:
                 logger.info(f"Finished request[{ctx.index}], duration: {ctx.e2e_latency}")
 

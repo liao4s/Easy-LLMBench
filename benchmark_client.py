@@ -27,11 +27,10 @@ import util
 '''
 example:
     python3 benchmark_client.py \
-	--endpoint http://0.0.0.0:30000/v1 \
+	--endpoint http://localhost:8000/v1 \
 	--dataset same_input \
-	--tokenizer /opt/ml/ti/model_cache/GLM-5-w8a8/ \
-	--model glm-5 \
-	--log-file out/glm5-50k-result.txt \
+	--tokenizer /data1/model/tmp/Qwen3.5-35B-A3B/ \
+	--model Qwen3.5-35B-A3B \
 	--sampling-policy fixed \
 	--parallel 1 \
     --fixed-prompt-len 50000 \
@@ -156,16 +155,53 @@ def main(args: argparse.Namespace):
         contexts[i].clean()
 
     logger.info("Benchmark")
-    start_time = time.perf_counter()
-    asyncio.run(sender.post_batch_requests_async(contexts, args.api_kind == "chat", args.parallel, extra))
-    e2e_duration = time.perf_counter() - start_time
-    logger.info(f"Benchmark fininshed in {e2e_duration} seconds")
+    if args.no_ramp_up:
+        # Original behavior: send all requests at full concurrency
+        start_time = time.perf_counter()
+        asyncio.run(sender.post_batch_requests_async(contexts, args.api_kind == "chat", args.parallel, extra))
+        e2e_duration = time.perf_counter() - start_time
+        logger.info(f"Benchmark fininshed in {e2e_duration} seconds")
+        measure_contexts = contexts
+    else:
+        # Ramp-up mode: add ramp-up and tail requests to maintain steady-state concurrency
+        ramp_up_count = args.parallel
+        tail_count = args.parallel
+        total_needed = ramp_up_count + args.num_requests + tail_count
+        logger.info(f"Ramp-up mode: ramp_up={ramp_up_count}, measurement={args.num_requests}, tail={tail_count}, total={total_needed}")
+
+        # Prepare extra contexts for ramp-up and tail by duplicating from existing samples
+        all_contexts = []
+        for i in range(total_needed):
+            src = contexts[i % len(contexts)]
+            if i < len(contexts):
+                all_contexts.append(src)
+            else:
+                all_contexts.append(Context(index=i, prompt=src.prompt, prompt_len=src.prompt_len, max_tokens=src.max_tokens))
+
+        start_time = time.perf_counter()
+        asyncio.run(sender.post_batch_requests_with_rampup(all_contexts, args.api_kind == "chat", args.parallel, extra, ramp_up_count))
+        total_duration = time.perf_counter() - start_time
+        logger.info(f"Benchmark (total including ramp-up/tail) fininshed in {total_duration} seconds")
+
+        # Only measure the middle num_requests contexts
+        measure_contexts = all_contexts[ramp_up_count : ramp_up_count + args.num_requests]
+
+        # Calculate duration from measurement window using absolute timestamps
+        valid_measure = [ctx for ctx in measure_contexts if not ctx.error and ctx.request_start_time > 0]
+        if valid_measure:
+            measure_start = min(ctx.request_start_time for ctx in valid_measure)
+            measure_end = max(ctx.request_start_time + ctx.e2e_latency for ctx in valid_measure)
+            e2e_duration = measure_end - measure_start
+        else:
+            e2e_duration = total_duration
+        logger.info(f"Measurement window duration: {e2e_duration:.2f} seconds (out of {total_duration:.2f} total)")
+
     # metrics
-    metrics, metrics_good = calculate_metrics(tokenizer, contexts, e2e_duration, args.slo_ttft, args.slo_tpot)
+    metrics, metrics_good = calculate_metrics(tokenizer, measure_contexts, e2e_duration, args.slo_ttft, args.slo_tpot)
     if metrics is None:
         logger.warning("Failed to get metrics")
         return
-    for ctx in contexts:
+    for ctx in measure_contexts:
        if ctx.error:
             logger.warning(f"[{ctx.index}] ERROR: {ctx.error}")
        if not args.disable_warn_dismatch_output_len and ctx.max_tokens > 0 and abs(ctx.output_len - ctx.max_tokens) > 10:
@@ -187,13 +223,15 @@ def main(args: argparse.Namespace):
     output += f"sampling-policy: {args.sampling_policy}\n"
     output += f"sequence-length: {prompt_len}, {gen_len}\n"
     output += f"num-requests: {args.num_requests}\n"
+    if not args.no_ramp_up:
+        output += f"ramp-up: enabled (ramp={args.parallel}, tail={args.parallel}, total-sent={args.parallel + args.num_requests + args.parallel})\n"
     output += f"batch-size: {args.parallel}\n"
     output += f"e2e-latency(avg, P50, P90, P99): {e2e_latency_avg:0.2f}, {e2e_latency_p[0]:.2f}, {e2e_latency_p[1]:.2f}, {e2e_latency_p[2]:.2f}\n"
     output += f"ttft(avg, P50, P90, P99): {ttft_avg:.2f}, {ttft_p[0]:.2f}, {ttft_p[1]:.2f}, {ttft_p[2]:.2f}\n"
     output += f"tpot(avg, P50, P90, P99): {tpot_avg:.2f}, {tpot_p[0]:.3f}, {tpot_p[1]:.3f}, {tpot_p[2]:.3f}\n"
     output += f"tps(avg, P50, P90, P99): {tps_avg:.2f}, {tps_p[0]:.1f}, {tps_p[1]:.1f}, {tps_p[2]:.1f}\n"
     output += f"throughput: {metrics.input_tokens/e2e_duration:.2f}, {metrics.output_tokens/e2e_duration:.2f}, {(metrics.input_tokens+metrics.output_tokens)/e2e_duration:.2f}\n"
-    output += f"rps: {len(contexts)/e2e_duration:.3f}\n"
+    output += f"rps: {len(measure_contexts)/e2e_duration:.3f}\n"
     output += f"goodput-throughput: {metrics_good.output_tokens/e2e_duration:.2f}\n"
     output += f"goodput-rps: {len(metrics_good.ttft)/e2e_duration:.3f}\n"
     output += f"e2e_duration: {e2e_duration}\n"
@@ -232,6 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-len-std", type=int, default=20)
     # press test setting
     parser.add_argument("--no-warmup", action="store_true", help="Disable warmup")
+    parser.add_argument("--no-ramp-up", action="store_true", help="Disable gradual ramp-up/tail mechanism. When ramp-up is enabled (default), extra requests are sent before and after the measurement window to ensure steady-state concurrency.")
     parser.add_argument("--num-requests", type=int, default=1000, help="Number of prompts for benckmark.")
     parser.add_argument("--parallel", type=int, default=10)
     parser.add_argument("--dataset", type=str, default="sharegpt", help="The local folder path to the dataset for testing")
